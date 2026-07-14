@@ -7,11 +7,10 @@ Firebase Realtime Database (dashboard reads it live, for everyone):
 
   * ALL stock prices + day change%      -> k_psx_overrides
   * Index membership per stock          -> k_psx_universe   (for KSE100/KMI30 tabs)
+  * Company names + sectors             -> k_psx_meta
   * ALL indices (KSE100, KMI30, ...)    -> k_psx_indices
   * KSE-100 value + change              -> k_psx_kse , k_psx_kseChg
   * Rolling high per stock (for dips)   -> k_psx_hi
-
-No secrets needed: DB URL is public and rules allow writes to 'psxShared'.
 """
 
 import re
@@ -57,7 +56,7 @@ def fetch_market():
     soup = BeautifulSoup(r.text, "html.parser")
     rows = soup.select("table tbody tr") or soup.find_all("tr")
 
-    overrides, universe, day_high = {}, {}, {}
+    overrides, universe, day_high, sectors = {}, {}, {}, {}
     for tr in rows:
         tds = tr.find_all("td")
         # SYMBOL,SECTOR,LISTED IN,LDCP,OPEN,HIGH,LOW,CURRENT,CHANGE,CHANGE(%),VOLUME
@@ -66,6 +65,7 @@ def fetch_market():
         sym = tds[0].get_text(strip=True).upper()
         if not re.match(r"^[A-Z][A-Z0-9]{1,11}$", sym):
             continue
+        sector = tds[1].get_text(strip=True)
         listed = tds[2].get_text(strip=True)
         ldcp = to_num(tds[3].get_text())
         high = to_num(tds[5].get_text())
@@ -77,8 +77,10 @@ def fetch_market():
             continue
         overrides[sym] = {"p": round(price, 2), "c": round(chg_pct or 0.0, 2)}
         universe[sym] = listed  # e.g. "ALLSHR,KMI30,KSE100"
+        if sector:
+            sectors[sym] = sector
         day_high[sym] = max(x for x in [high, current, ldcp] if x) or price
-    return overrides, universe, day_high
+    return overrides, universe, day_high, sectors
 
 
 def fetch_indices():
@@ -104,8 +106,30 @@ def fetch_indices():
     return indices
 
 
+SYMBOLS_URL = "https://dps.psx.com.pk/symbols"
+
+def fetch_names():
+    """PSX symbols endpoint -> {SYM: company name}. Best-effort (defensive)."""
+    names = {}
+    try:
+        r = requests.get(SYMBOLS_URL, headers=HEADERS, timeout=45)
+        r.raise_for_status()
+        data = r.json()
+        rows = data if isinstance(data, list) else data.get("data", data.get("symbols", []))
+        for it in rows:
+            if not isinstance(it, dict):
+                continue
+            sym = (it.get("symbol") or it.get("Symbol") or it.get("sym") or "").upper()
+            nm = it.get("name") or it.get("Name") or it.get("companyName") or it.get("company") or ""
+            if sym and nm:
+                names[sym] = nm.strip()
+    except Exception as e:
+        print("names warn:", e)
+    return names
+
+
 def main():
-    overrides, universe, day_high = fetch_market()
+    overrides, universe, day_high, sectors = fetch_market()
     print(f"Parsed {len(overrides)} symbols from market-watch.")
     if len(overrides) < 50:
         print("Too few symbols — site may have changed. Aborting.")
@@ -114,6 +138,25 @@ def main():
     put_json("/psxShared/k_psx_overrides.json", overrides)
     put_json("/psxShared/k_psx_universe.json", universe)
     print("Wrote prices + universe.")
+
+    # company names + sectors -> k_psx_meta  {SYM:{n:name, s:sector}}
+    try:
+        names = fetch_names()
+        meta = {}
+        for s in overrides.keys():
+            entry = {}
+            if names.get(s):
+                entry["n"] = names[s]
+            if sectors.get(s):
+                entry["s"] = sectors[s]
+            if entry:
+                meta[s] = entry
+        if meta:
+            put_json("/psxShared/k_psx_meta.json", meta)
+            print(f"Wrote meta (names/sectors) for {len(meta)} symbols "
+                  f"({len(names)} names, {len(sectors)} sectors).")
+    except Exception as e:
+        print("meta warn:", e)
 
     # rolling high (for dip alerts) — merge with what we've seen before
     try:
