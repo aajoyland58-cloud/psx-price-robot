@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """
-PSX Price Robot (v2)
+PSX Price Robot (v3)
 --------------------
-Every run it fetches from the official PSX Data Portal and writes to your
-Firebase Realtime Database (dashboard reads it live, for everyone):
-
-  * ALL stock prices + day change%      -> k_psx_overrides
-  * Index membership per stock          -> k_psx_universe   (for KSE100/KMI30 tabs)
-  * Company names + sectors             -> k_psx_meta
-  * ALL indices (KSE100, KMI30, ...)    -> k_psx_indices
-  * KSE-100 value + change              -> k_psx_kse , k_psx_kseChg
-  * Rolling high per stock (for dips)   -> k_psx_hi
+Har run par official PSX Data Portal se data le kar Firebase mein likhta hai:
+  * ALL stock prices + day change%   -> k_psx_overrides
+  * Index membership per stock        -> k_psx_universe
+  * Company names + sectors           -> k_psx_meta
+  * ALL indices (KSE100, KMI30, ...)  -> k_psx_indices
+  * KSE-100 value + change            -> k_psx_kse , k_psx_kseChg
+  * Rolling high per stock (dips)     -> k_psx_hi
+  * Last-update timestamp             -> k_psx_updated   (dashboard staleness check)
 """
 
 import re
 import sys
+import time
 import requests
 from bs4 import BeautifulSoup
 
 DB = "https://psx-dashboard-2b391-default-rtdb.asia-southeast1.firebasedatabase.app"
 MARKET_WATCH = "https://dps.psx.com.pk/market-watch"
 INDICES = "https://dps.psx.com.pk/indices"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; psx-dashboard-bot/2.0)"}
+SYMBOLS_URL = "https://dps.psx.com.pk/symbols"
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; psx-dashboard-bot/3.0)"}
 
 
 def to_num(text):
@@ -76,7 +77,7 @@ def fetch_market():
         if price is None or price <= 0:
             continue
         overrides[sym] = {"p": round(price, 2), "c": round(chg_pct or 0.0, 2)}
-        universe[sym] = listed  # e.g. "ALLSHR,KMI30,KSE100"
+        universe[sym] = listed
         if sector:
             sectors[sym] = sector
         day_high[sym] = max(x for x in [high, current, ldcp] if x) or price
@@ -91,7 +92,6 @@ def fetch_indices():
     indices = {}
     for tr in rows:
         tds = tr.find_all("td")
-        # Index, High, Low, Current, Change, % Change
         if len(tds) < 6:
             continue
         name = tds[0].get_text(strip=True).upper()
@@ -106,10 +106,7 @@ def fetch_indices():
     return indices
 
 
-SYMBOLS_URL = "https://dps.psx.com.pk/symbols"
-
 def fetch_names():
-    """PSX symbols endpoint -> {SYM: company name}. Best-effort (defensive)."""
     names = {}
     try:
         r = requests.get(SYMBOLS_URL, headers=HEADERS, timeout=45)
@@ -139,7 +136,6 @@ def main():
     put_json("/psxShared/k_psx_universe.json", universe)
     print("Wrote prices + universe.")
 
-    # company names + sectors -> k_psx_meta  {SYM:{n:name, s:sector}}
     try:
         names = fetch_names()
         meta = {}
@@ -153,12 +149,10 @@ def main():
                 meta[s] = entry
         if meta:
             put_json("/psxShared/k_psx_meta.json", meta)
-            print(f"Wrote meta (names/sectors) for {len(meta)} symbols "
-                  f"({len(names)} names, {len(sectors)} sectors).")
+            print(f"Wrote meta for {len(meta)} symbols ({len(names)} names, {len(sectors)} sectors).")
     except Exception as e:
         print("meta warn:", e)
 
-    # rolling high (for dip alerts) — merge with what we've seen before
     try:
         hi = get_json("/psxShared/k_psx_hi.json", {}) or {}
         for s, h in day_high.items():
@@ -169,7 +163,6 @@ def main():
     except Exception as e:
         print("hi warn:", e)
 
-    # indices
     try:
         idx = fetch_indices()
         if idx:
@@ -180,6 +173,12 @@ def main():
             print(f"Wrote {len(idx)} indices.")
     except Exception as e:
         print("indices warn:", e)
+
+    try:
+        put_json("/psxShared/k_psx_updated.json", int(time.time()))
+        print("Wrote last-update timestamp.")
+    except Exception as e:
+        print("updated warn:", e)
 
     print("Done.")
 
