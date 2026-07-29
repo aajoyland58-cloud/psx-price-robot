@@ -1,26 +1,26 @@
 name: Update PSX prices
 
 on:
-  # Every 15 minutes, 04:00–10:59 UTC ≈ 09:00–15:59 PKT, Monday–Friday
   schedule:
-    - cron: "*/15 4-10 * * 1-5"
-  # Lets you run it manually from the Actions tab (great for testing)
-  workflow_dispatch: {}
+    # Har 10 min, PSX market hours (approx 9:00–15:45 PKT = 04:00–10:45 UTC), Mon–Fri
+    - cron: "*/10 4-10 * * 1-5"
+  workflow_dispatch: {}   # manual run button
+
+# purane runs cancel na hon, overlap avoid
+concurrency:
+  group: psx-prices
+  cancel-in-progress: false
 
 jobs:
   update-prices:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install dependencies
         run: pip install requests beautifulsoup4
-
       - name: Fetch prices and push to Firebase
         run: python update_prices.py
