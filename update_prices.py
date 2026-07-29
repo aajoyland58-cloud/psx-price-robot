@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-PSX Price Robot (v3)
+PSX Price Robot (v2)
 --------------------
-Har run par official PSX Data Portal se data le kar Firebase mein likhta hai:
-  * ALL stock prices + day change%   -> k_psx_overrides
-  * Index membership per stock        -> k_psx_universe
-  * Company names + sectors           -> k_psx_meta
-  * ALL indices (KSE100, KMI30, ...)  -> k_psx_indices
-  * KSE-100 value + change            -> k_psx_kse , k_psx_kseChg
-  * Rolling high per stock (dips)     -> k_psx_hi
-  * Last-update timestamp             -> k_psx_updated   (dashboard staleness check)
+Every run it fetches from the official PSX Data Portal and writes to your
+Firebase Realtime Database (dashboard reads it live, for everyone):
+
+  * ALL stock prices + day change%      -> k_psx_overrides
+  * Index membership per stock          -> k_psx_universe   (for KSE100/KMI30 tabs)
+  * ALL indices (KSE100, KMI30, ...)    -> k_psx_indices
+  * KSE-100 value + change              -> k_psx_kse , k_psx_kseChg
+  * Rolling high per stock (for dips)   -> k_psx_hi
+
+No secrets needed: DB URL is public and rules allow writes to 'psxShared'.
 """
 
 import re
@@ -21,8 +23,7 @@ from bs4 import BeautifulSoup
 DB = "https://psx-dashboard-2b391-default-rtdb.asia-southeast1.firebasedatabase.app"
 MARKET_WATCH = "https://dps.psx.com.pk/market-watch"
 INDICES = "https://dps.psx.com.pk/indices"
-SYMBOLS_URL = "https://dps.psx.com.pk/symbols"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; psx-dashboard-bot/3.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; psx-dashboard-bot/2.0)"}
 
 
 def to_num(text):
@@ -77,7 +78,7 @@ def fetch_market():
         if price is None or price <= 0:
             continue
         overrides[sym] = {"p": round(price, 2), "c": round(chg_pct or 0.0, 2)}
-        universe[sym] = listed
+        universe[sym] = listed  # e.g. "ALLSHR,KMI30,KSE100"
         if sector:
             sectors[sym] = sector
         day_high[sym] = max(x for x in [high, current, ldcp] if x) or price
@@ -92,6 +93,7 @@ def fetch_indices():
     indices = {}
     for tr in rows:
         tds = tr.find_all("td")
+        # Index, High, Low, Current, Change, % Change
         if len(tds) < 6:
             continue
         name = tds[0].get_text(strip=True).upper()
@@ -106,7 +108,45 @@ def fetch_indices():
     return indices
 
 
+SYMBOLS_URL = "https://dps.psx.com.pk/symbols"
+
+MUFAP_NAV = "https://www.mufap.com.pk/nav-report.php"
+# dashboard symbol -> MUFAP fund name (substring match, UPPERCASE). Add more funds here.
+FUND_MAP = {"MIF": "MEEZAN ISLAMIC FUND"}
+
+
+def fetch_fund_navs():
+    """Mutual-fund NAVs from MUFAP daily report -> {SYM: nav}. Best-effort."""
+    navs = {}
+    try:
+        r = requests.get(MUFAP_NAV, headers=HEADERS, timeout=45)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        rowdata = []
+        for tr in soup.find_all("tr"):
+            tds = tr.find_all("td")
+            if len(tds) < 2:
+                continue
+            name = tds[0].get_text(" ", strip=True).upper()
+            if not name:
+                continue
+            for td in tds[1:]:
+                val = to_num(td.get_text())
+                if val is not None and val > 0:
+                    rowdata.append((name, val))
+                    break
+        for sym, target in FUND_MAP.items():
+            for name, val in rowdata:
+                if target in name:
+                    navs[sym] = round(val, 4)
+                    break
+    except Exception as e:
+        print("nav fetch warn:", e)
+    return navs
+
+
 def fetch_names():
+    """PSX symbols endpoint -> {SYM: company name}. Best-effort (defensive)."""
     names = {}
     try:
         r = requests.get(SYMBOLS_URL, headers=HEADERS, timeout=45)
@@ -136,6 +176,7 @@ def main():
     put_json("/psxShared/k_psx_universe.json", universe)
     print("Wrote prices + universe.")
 
+    # company names + sectors -> k_psx_meta  {SYM:{n:name, s:sector}}
     try:
         names = fetch_names()
         meta = {}
@@ -149,10 +190,12 @@ def main():
                 meta[s] = entry
         if meta:
             put_json("/psxShared/k_psx_meta.json", meta)
-            print(f"Wrote meta for {len(meta)} symbols ({len(names)} names, {len(sectors)} sectors).")
+            print(f"Wrote meta (names/sectors) for {len(meta)} symbols "
+                  f"({len(names)} names, {len(sectors)} sectors).")
     except Exception as e:
         print("meta warn:", e)
 
+    # rolling high (for dip alerts) — merge with what we've seen before
     try:
         hi = get_json("/psxShared/k_psx_hi.json", {}) or {}
         for s, h in day_high.items():
@@ -163,6 +206,7 @@ def main():
     except Exception as e:
         print("hi warn:", e)
 
+    # indices
     try:
         idx = fetch_indices()
         if idx:
@@ -174,6 +218,18 @@ def main():
     except Exception as e:
         print("indices warn:", e)
 
+    # mutual-fund NAVs (MUFAP) -> k_psx_navs  (e.g. Meezan Islamic Fund)
+    try:
+        fnavs = fetch_fund_navs()
+        if fnavs:
+            put_json("/psxShared/k_psx_navs.json", fnavs)
+            print(f"Wrote fund NAVs: {fnavs}")
+        else:
+            print("No fund NAVs parsed (funds stay on manual value).")
+    except Exception as e:
+        print("navs warn:", e)
+
+    # last-update timestamp (epoch seconds, UTC) — dashboard staleness check
     try:
         put_json("/psxShared/k_psx_updated.json", int(time.time()))
         print("Wrote last-update timestamp.")
