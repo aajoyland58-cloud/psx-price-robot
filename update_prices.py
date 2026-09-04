@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""
-PSX Price Robot (v2)
---------------------
-Every run it fetches from the official PSX Data Portal and writes to your
-Firebase Realtime Database (dashboard reads it live, for everyone):
-
-  * ALL stock prices + day change%      -> k_psx_overrides
-  * Index membership per stock          -> k_psx_universe   (for KSE100/KMI30 tabs)
-  * ALL indices (KSE100, KMI30, ...)    -> k_psx_indices
-  * KSE-100 value + change              -> k_psx_kse , k_psx_kseChg
-  * Rolling high per stock (for dips)   -> k_psx_hi
-
-No secrets needed: DB URL is public and rules allow writes to 'psxShared'.
-"""
+"""PSX Price Robot — prices, names, indices, fund NAV, 52-week high/low, freshness."""
 
 import re
 import sys
@@ -61,7 +48,6 @@ def fetch_market():
     overrides, universe, day_high, sectors = {}, {}, {}, {}
     for tr in rows:
         tds = tr.find_all("td")
-        # SYMBOL,SECTOR,LISTED IN,LDCP,OPEN,HIGH,LOW,CURRENT,CHANGE,CHANGE(%),VOLUME
         if len(tds) < 10:
             continue
         sym = tds[0].get_text(strip=True).upper()
@@ -78,7 +64,7 @@ def fetch_market():
         if price is None or price <= 0:
             continue
         overrides[sym] = {"p": round(price, 2), "c": round(chg_pct or 0.0, 2)}
-        universe[sym] = listed  # e.g. "ALLSHR,KMI30,KSE100"
+        universe[sym] = listed
         if sector:
             sectors[sym] = sector
         day_high[sym] = max(x for x in [high, current, ldcp] if x) or price
@@ -93,7 +79,6 @@ def fetch_indices():
     indices = {}
     for tr in rows:
         tds = tr.find_all("td")
-        # Index, High, Low, Current, Change, % Change
         if len(tds) < 6:
             continue
         name = tds[0].get_text(strip=True).upper()
@@ -109,14 +94,11 @@ def fetch_indices():
 
 
 SYMBOLS_URL = "https://dps.psx.com.pk/symbols"
-
 MUFAP_NAV = "https://www.mufap.com.pk/nav-report.php"
-# dashboard symbol -> MUFAP fund name (substring match, UPPERCASE). Add more funds here.
 FUND_MAP = {"MIF": "MEEZAN ISLAMIC FUND"}
 
 
 def fetch_fund_navs():
-    """Mutual-fund NAVs from MUFAP daily report -> {SYM: nav}. Best-effort."""
     navs = {}
     try:
         r = requests.get(MUFAP_NAV, headers=HEADERS, timeout=45)
@@ -145,8 +127,52 @@ def fetch_fund_navs():
     return navs
 
 
+EOD_URL = "https://dps.psx.com.pk/timeseries/eod/{}"
+
+
+def fetch_52w(symbols):
+    out = {}
+    cutoff = time.time() - 365 * 24 * 3600
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    done = 0
+    for sym in symbols:
+        try:
+            r = sess.get(EOD_URL.format(sym), timeout=20)
+            if not r.ok:
+                continue
+            data = r.json()
+            rows = data.get("data") if isinstance(data, dict) else data
+            if not rows:
+                continue
+            hi = lo = None
+            for row in rows:
+                if not isinstance(row, (list, tuple)) or len(row) < 2:
+                    continue
+                ts, px = row[0], row[1]
+                if ts is None or px is None:
+                    continue
+                t = ts / 1000 if ts > 1e12 else ts
+                if t < cutoff:
+                    continue
+                try:
+                    px = float(px)
+                except (TypeError, ValueError):
+                    continue
+                if px <= 0:
+                    continue
+                hi = px if hi is None else max(hi, px)
+                lo = px if lo is None else min(lo, px)
+            if hi:
+                out[sym] = {"h": round(hi, 2), "l": round(lo, 2)}
+                done += 1
+        except Exception:
+            continue
+    print(f"52-week computed for {done}/{len(symbols)} symbols.")
+    return out
+
+
 def fetch_names():
-    """PSX symbols endpoint -> {SYM: company name}. Best-effort (defensive)."""
     names = {}
     try:
         r = requests.get(SYMBOLS_URL, headers=HEADERS, timeout=45)
@@ -169,14 +195,13 @@ def main():
     overrides, universe, day_high, sectors = fetch_market()
     print(f"Parsed {len(overrides)} symbols from market-watch.")
     if len(overrides) < 50:
-        print("Too few symbols — site may have changed. Aborting.")
+        print("Too few symbols — aborting.")
         sys.exit(1)
 
     put_json("/psxShared/k_psx_overrides.json", overrides)
     put_json("/psxShared/k_psx_universe.json", universe)
     print("Wrote prices + universe.")
 
-    # company names + sectors -> k_psx_meta  {SYM:{n:name, s:sector}}
     try:
         names = fetch_names()
         meta = {}
@@ -190,12 +215,10 @@ def main():
                 meta[s] = entry
         if meta:
             put_json("/psxShared/k_psx_meta.json", meta)
-            print(f"Wrote meta (names/sectors) for {len(meta)} symbols "
-                  f"({len(names)} names, {len(sectors)} sectors).")
+            print(f"Wrote meta for {len(meta)} symbols.")
     except Exception as e:
         print("meta warn:", e)
 
-    # rolling high (for dip alerts) — merge with what we've seen before
     try:
         hi = get_json("/psxShared/k_psx_hi.json", {}) or {}
         for s, h in day_high.items():
@@ -206,7 +229,6 @@ def main():
     except Exception as e:
         print("hi warn:", e)
 
-    # indices
     try:
         idx = fetch_indices()
         if idx:
@@ -218,18 +240,31 @@ def main():
     except Exception as e:
         print("indices warn:", e)
 
-    # mutual-fund NAVs (MUFAP) -> k_psx_navs  (e.g. Meezan Islamic Fund)
     try:
         fnavs = fetch_fund_navs()
         if fnavs:
             put_json("/psxShared/k_psx_navs.json", fnavs)
             print(f"Wrote fund NAVs: {fnavs}")
         else:
-            print("No fund NAVs parsed (funds stay on manual value).")
+            print("No fund NAVs parsed.")
     except Exception as e:
         print("navs warn:", e)
 
-    # last-update timestamp (epoch seconds, UTC) — dashboard staleness check
+    try:
+        last52 = get_json("/psxShared/k_psx_52w_updated.json", 0) or 0
+        if time.time() - float(last52) > 20 * 3600:
+            w52 = fetch_52w(list(overrides.keys()))
+            if len(w52) >= 50:
+                put_json("/psxShared/k_psx_52w.json", w52)
+                put_json("/psxShared/k_psx_52w_updated.json", int(time.time()))
+                print(f"Wrote 52-week high/low for {len(w52)} symbols.")
+            else:
+                print(f"52-week fetch too few ({len(w52)}) — kept old.")
+        else:
+            print("52-week data fresh (<20h) — skipped.")
+    except Exception as e:
+        print("52w warn:", e)
+
     try:
         put_json("/psxShared/k_psx_updated.json", int(time.time()))
         print("Wrote last-update timestamp.")
