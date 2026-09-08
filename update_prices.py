@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""PSX Price Robot — prices, names, indices, fund NAV, 52-week high/low, freshness."""
+"""PSX Price Robot — prices, names, indices, fund NAV, 52-week high/low, freshness.
+   v2.1 — faster & timeout-safe 52-week fetch (won't hang the workflow)."""
 
 import re
 import sys
@@ -10,7 +11,12 @@ from bs4 import BeautifulSoup
 DB = "https://psx-dashboard-2b391-default-rtdb.asia-southeast1.firebasedatabase.app"
 MARKET_WATCH = "https://dps.psx.com.pk/market-watch"
 INDICES = "https://dps.psx.com.pk/indices"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; psx-dashboard-bot/2.0)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; psx-dashboard-bot/2.1)"}
+
+# ---- 52-week fetch controls (NEW) ----
+W52_PER_REQ_TIMEOUT = 8      # per-symbol network timeout (was 20)
+W52_TIME_BUDGET = 180        # max seconds the whole 52w step may run, then stop cleanly
+W52_MAX_RETRIES = 1          # quick retry on a failed call, then move on
 
 
 def to_num(text):
@@ -131,44 +137,65 @@ EOD_URL = "https://dps.psx.com.pk/timeseries/eod/{}"
 
 
 def fetch_52w(symbols):
+    """Timeout-safe: reuses one session, short per-request timeout, and stops
+    cleanly once the overall time budget is hit so it never hangs the workflow."""
     out = {}
     cutoff = time.time() - 365 * 24 * 3600
     sess = requests.Session()
     sess.headers.update(HEADERS)
     done = 0
-    for sym in symbols:
-        try:
-            r = sess.get(EOD_URL.format(sym), timeout=20)
-            if not r.ok:
-                continue
-            data = r.json()
-            rows = data.get("data") if isinstance(data, dict) else data
-            if not rows:
-                continue
-            hi = lo = None
-            for row in rows:
-                if not isinstance(row, (list, tuple)) or len(row) < 2:
-                    continue
-                ts, px = row[0], row[1]
-                if ts is None or px is None:
-                    continue
-                t = ts / 1000 if ts > 1e12 else ts
-                if t < cutoff:
-                    continue
-                try:
-                    px = float(px)
-                except (TypeError, ValueError):
-                    continue
-                if px <= 0:
-                    continue
-                hi = px if hi is None else max(hi, px)
-                lo = px if lo is None else min(lo, px)
-            if hi:
-                out[sym] = {"h": round(hi, 2), "l": round(lo, 2)}
-                done += 1
-        except Exception:
+    started = time.time()
+    stopped_early = False
+
+    for i, sym in enumerate(symbols):
+        # NEW: overall time budget guard
+        if time.time() - started > W52_TIME_BUDGET:
+            stopped_early = True
+            print(f"52-week time budget ({W52_TIME_BUDGET}s) reached at "
+                  f"{i}/{len(symbols)} — stopping cleanly.")
+            break
+
+        data = None
+        for attempt in range(W52_MAX_RETRIES + 1):
+            try:
+                r = sess.get(EOD_URL.format(sym), timeout=W52_PER_REQ_TIMEOUT)
+                if r.ok:
+                    data = r.json()
+                break
+            except Exception:
+                if attempt >= W52_MAX_RETRIES:
+                    data = None
+                # else: quick retry once
+
+        if not data:
             continue
-    print(f"52-week computed for {done}/{len(symbols)} symbols.")
+        rows = data.get("data") if isinstance(data, dict) else data
+        if not rows:
+            continue
+        hi = lo = None
+        for row in rows:
+            if not isinstance(row, (list, tuple)) or len(row) < 2:
+                continue
+            ts, px = row[0], row[1]
+            if ts is None or px is None:
+                continue
+            t = ts / 1000 if ts > 1e12 else ts
+            if t < cutoff:
+                continue
+            try:
+                px = float(px)
+            except (TypeError, ValueError):
+                continue
+            if px <= 0:
+                continue
+            hi = px if hi is None else max(hi, px)
+            lo = px if lo is None else min(lo, px)
+        if hi:
+            out[sym] = {"h": round(hi, 2), "l": round(lo, 2)}
+            done += 1
+
+    print(f"52-week computed for {done}/{len(symbols)} symbols"
+          f"{' (partial — time budget)' if stopped_early else ''}.")
     return out
 
 
