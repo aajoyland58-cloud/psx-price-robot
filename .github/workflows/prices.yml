@@ -4,16 +4,15 @@ on:
   schedule:
     # Har 10 min, UTC 4:00-10:59 (= PKT 9:00 AM - 3:59 PM), Mon-Fri
     - cron: "*/10 4-10 * * 1-5"
-  workflow_dispatch:   # manual run bhi rahega (button)
+  workflow_dispatch:
 
-# Workflow ko repo mein likhne (commit) ki ijazat
 permissions:
   contents: write
 
 jobs:
   update-prices:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -30,7 +29,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # sirf tab commit karo jab file mein sach mein change hua ho
           if [ -n "$(git status --porcelain)" ]; then
             git add -A
             git commit -m "Auto-update PSX prices [skip ci]"
