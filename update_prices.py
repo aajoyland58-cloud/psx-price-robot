@@ -199,6 +199,62 @@ def fetch_52w(symbols):
     return out
 
 
+
+# ---- MTD Gainers (5-25%) + Dips (from 52-week high) ----
+MTD_MIN = 5.0
+MTD_MAX = 25.0
+DIP_MIN = 5.0
+
+
+def compute_mtd_gainers(overrides):
+    ym = time.strftime("%Y-%m")
+    base = get_json("/psxShared/k_psx_mtd_base.json", {}) or {}
+    if base.get("month") != ym:
+        base = {"month": ym, "prices": {s: v["p"] for s, v in overrides.items()}}
+        put_json("/psxShared/k_psx_mtd_base.json", base)
+        put_json("/psxShared/k_psx_mtd_gainers.json", {})
+        print(f"MTD baseline set for {ym} ({len(base['prices'])} symbols).")
+        return
+    start = base.get("prices", {})
+    gainers = {}
+    for sym, v in overrides.items():
+        p0 = start.get(sym); p1 = v.get("p")
+        if not p0 or not p1 or p0 <= 0:
+            continue
+        mtd = (p1 - p0) / p0 * 100.0
+        if MTD_MIN <= mtd <= MTD_MAX:
+            gainers[sym] = {"p": p1, "mtd": round(mtd, 2)}
+    changed = False
+    for sym, v in overrides.items():
+        if sym not in start:
+            start[sym] = v["p"]; changed = True
+    if changed:
+        base["prices"] = start
+        put_json("/psxShared/k_psx_mtd_base.json", base)
+    put_json("/psxShared/k_psx_mtd_gainers.json", gainers)
+    print(f"MTD gainers ({MTD_MIN}-{MTD_MAX}%): {len(gainers)} symbols.")
+
+
+def compute_dips(overrides):
+    w52 = get_json("/psxShared/k_psx_52w.json", {}) or {}
+    if not w52:
+        print("Dips: no 52-week data yet - skipped.")
+        return
+    dips = {}
+    for sym, v in overrides.items():
+        info = w52.get(sym); p1 = v.get("p")
+        if not info or not p1:
+            continue
+        hi = info.get("h")
+        if not hi or hi <= 0:
+            continue
+        dip = (p1 - hi) / hi * 100.0
+        if dip <= -DIP_MIN:
+            dips[sym] = {"p": p1, "hi": hi, "lo": info.get("l"), "dip": round(dip, 2)}
+    put_json("/psxShared/k_psx_dips.json", dips)
+    print(f"Dips (>= {DIP_MIN}% below 52w high): {len(dips)} symbols.")
+
+
 def fetch_names():
     names = {}
     try:
@@ -291,6 +347,16 @@ def main():
             print("52-week data fresh (<20h) — skipped.")
     except Exception as e:
         print("52w warn:", e)
+
+    try:
+        compute_mtd_gainers(overrides)
+    except Exception as e:
+        print("mtd warn:", e)
+
+    try:
+        compute_dips(overrides)
+    except Exception as e:
+        print("dips warn:", e)
 
     try:
         put_json("/psxShared/k_psx_updated.json", int(time.time()))
