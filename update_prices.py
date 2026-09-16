@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
-"""
-PSX Price Robot (v2)
---------------------
-Every run it fetches from the official PSX Data Portal and writes to your
-Firebase Realtime Database (dashboard reads it live, for everyone):
-
-  * ALL stock prices + day change%      -> k_psx_overrides
-  * Index membership per stock          -> k_psx_universe   (for KSE100/KMI30 tabs)
-  * ALL indices (KSE100, KMI30, ...)    -> k_psx_indices
-  * KSE-100 value + change              -> k_psx_kse , k_psx_kseChg
-  * Rolling high per stock (for dips)   -> k_psx_hi
-
-No secrets needed: DB URL is public and rules allow writes to 'psxShared'.
-"""
+"""PSX Price Robot — prices, names, indices, fund NAV, 52-week, news, freshness."""
 
 import re
 import sys
@@ -21,34 +8,17 @@ import requests
 import xml.etree.ElementTree as ET
 from bs4 import BeautifulSoup
 
-NEWS_RSS = ("https://news.google.com/rss/search?"
-            "q=KSE-100%20OR%20%22Pakistan%20Stock%20Exchange%22%20market"
-            "&hl=en-PK&gl=PK&ceid=PK:en")
-
-
-def fetch_news():
-    """Latest KSE-100 / PSX news headlines from Google News RSS -> list."""
-    out = []
-    try:
-        r = requests.get(NEWS_RSS, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        root = ET.fromstring(r.content)
-        for item in root.iter("item"):
-            title = (item.findtext("title") or "").strip()
-            link = (item.findtext("link") or "").strip()
-            pub = (item.findtext("pubDate") or "").strip()
-            if title:
-                out.append({"t": title, "u": link, "d": pub})
-            if len(out) >= 6:
-                break
-    except Exception as e:
-        print("news warn:", e)
-    return out
-
 DB = "https://psx-dashboard-2b391-default-rtdb.asia-southeast1.firebasedatabase.app"
 MARKET_WATCH = "https://dps.psx.com.pk/market-watch"
 INDICES = "https://dps.psx.com.pk/indices"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; psx-dashboard-bot/2.0)"}
+SYMBOLS_URL = "https://dps.psx.com.pk/symbols"
+MUFAP_NAV = "https://www.mufap.com.pk/nav-report.php"
+EOD_URL = "https://dps.psx.com.pk/timeseries/eod/{}"
+NEWS_RSS = ("https://news.google.com/rss/search?"
+            "q=KSE-100%20OR%20%22Pakistan%20Stock%20Exchange%22%20market"
+            "&hl=en-PK&gl=PK&ceid=PK:en")
+FUND_MAP = {"MIF": "MEEZAN ISLAMIC FUND"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; psx-dashboard-bot/3.0)"}
 
 
 def to_num(text):
@@ -82,11 +52,9 @@ def fetch_market():
     r.raise_for_status()
     soup = BeautifulSoup(r.text, "html.parser")
     rows = soup.select("table tbody tr") or soup.find_all("tr")
-
     overrides, universe, day_high, sectors = {}, {}, {}, {}
     for tr in rows:
         tds = tr.find_all("td")
-        # SYMBOL,SECTOR,LISTED IN,LDCP,OPEN,HIGH,LOW,CURRENT,CHANGE,CHANGE(%),VOLUME
         if len(tds) < 10:
             continue
         sym = tds[0].get_text(strip=True).upper()
@@ -98,12 +66,11 @@ def fetch_market():
         high = to_num(tds[5].get_text())
         current = to_num(tds[7].get_text())
         chg_pct = to_num(tds[9].get_text())
-
         price = current if (current and current > 0) else ldcp
         if price is None or price <= 0:
             continue
         overrides[sym] = {"p": round(price, 2), "c": round(chg_pct or 0.0, 2)}
-        universe[sym] = listed  # e.g. "ALLSHR,KMI30,KSE100"
+        universe[sym] = listed
         if sector:
             sectors[sym] = sector
         day_high[sym] = max(x for x in [high, current, ldcp] if x) or price
@@ -118,7 +85,6 @@ def fetch_indices():
     indices = {}
     for tr in rows:
         tds = tr.find_all("td")
-        # Index, High, Low, Current, Change, % Change
         if len(tds) < 6:
             continue
         name = tds[0].get_text(strip=True).upper()
@@ -133,15 +99,7 @@ def fetch_indices():
     return indices
 
 
-SYMBOLS_URL = "https://dps.psx.com.pk/symbols"
-
-MUFAP_NAV = "https://www.mufap.com.pk/nav-report.php"
-# dashboard symbol -> MUFAP fund name (substring match, UPPERCASE). Add more funds here.
-FUND_MAP = {"MIF": "MEEZAN ISLAMIC FUND"}
-
-
 def fetch_fund_navs():
-    """Mutual-fund NAVs from MUFAP daily report -> {SYM: nav}. Best-effort."""
     navs = {}
     try:
         r = requests.get(MUFAP_NAV, headers=HEADERS, timeout=45)
@@ -170,12 +128,7 @@ def fetch_fund_navs():
     return navs
 
 
-EOD_URL = "https://dps.psx.com.pk/timeseries/eod/{}"
-
-
 def fetch_52w(symbols):
-    """Per symbol, fetch EOD history from PSX and compute true 52-week high/low.
-    Heavy (one request per symbol) — call at most once per day."""
     out = {}
     cutoff = time.time() - 365 * 24 * 3600
     sess = requests.Session()
@@ -218,7 +171,6 @@ def fetch_52w(symbols):
 
 
 def fetch_names():
-    """PSX symbols endpoint -> {SYM: company name}. Best-effort (defensive)."""
     names = {}
     try:
         r = requests.get(SYMBOLS_URL, headers=HEADERS, timeout=45)
@@ -237,18 +189,36 @@ def fetch_names():
     return names
 
 
+def fetch_news():
+    out = []
+    try:
+        r = requests.get(NEWS_RSS, headers=HEADERS, timeout=30)
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        for item in root.iter("item"):
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            pub = (item.findtext("pubDate") or "").strip()
+            if title:
+                out.append({"t": title, "u": link, "d": pub})
+            if len(out) >= 6:
+                break
+    except Exception as e:
+        print("news warn:", e)
+    return out
+
+
 def main():
     overrides, universe, day_high, sectors = fetch_market()
     print(f"Parsed {len(overrides)} symbols from market-watch.")
     if len(overrides) < 50:
-        print("Too few symbols — site may have changed. Aborting.")
+        print("Too few symbols — aborting.")
         sys.exit(1)
 
     put_json("/psxShared/k_psx_overrides.json", overrides)
     put_json("/psxShared/k_psx_universe.json", universe)
     print("Wrote prices + universe.")
 
-    # company names + sectors -> k_psx_meta  {SYM:{n:name, s:sector}}
     try:
         names = fetch_names()
         meta = {}
@@ -262,12 +232,10 @@ def main():
                 meta[s] = entry
         if meta:
             put_json("/psxShared/k_psx_meta.json", meta)
-            print(f"Wrote meta (names/sectors) for {len(meta)} symbols "
-                  f"({len(names)} names, {len(sectors)} sectors).")
+            print(f"Wrote meta for {len(meta)} symbols.")
     except Exception as e:
         print("meta warn:", e)
 
-    # rolling high (for dip alerts) — merge with what we've seen before
     try:
         hi = get_json("/psxShared/k_psx_hi.json", {}) or {}
         for s, h in day_high.items():
@@ -278,7 +246,6 @@ def main():
     except Exception as e:
         print("hi warn:", e)
 
-    # indices
     try:
         idx = fetch_indices()
         if idx:
@@ -290,18 +257,16 @@ def main():
     except Exception as e:
         print("indices warn:", e)
 
-    # mutual-fund NAVs (MUFAP) -> k_psx_navs  (e.g. Meezan Islamic Fund)
     try:
         fnavs = fetch_fund_navs()
         if fnavs:
             put_json("/psxShared/k_psx_navs.json", fnavs)
             print(f"Wrote fund NAVs: {fnavs}")
         else:
-            print("No fund NAVs parsed (funds stay on manual value).")
+            print("No fund NAVs parsed.")
     except Exception as e:
         print("navs warn:", e)
 
-    # 52-week high/low (real, from EOD history) -> k_psx_52w  · once per ~day (heavy)
     try:
         last52 = get_json("/psxShared/k_psx_52w_updated.json", 0) or 0
         if time.time() - float(last52) > 20 * 3600:
@@ -311,13 +276,12 @@ def main():
                 put_json("/psxShared/k_psx_52w_updated.json", int(time.time()))
                 print(f"Wrote 52-week high/low for {len(w52)} symbols.")
             else:
-                print(f"52-week fetch too few ({len(w52)}) — kept old data.")
+                print(f"52-week fetch too few ({len(w52)}) — kept old.")
         else:
             print("52-week data fresh (<20h) — skipped.")
     except Exception as e:
         print("52w warn:", e)
 
-    # market news headlines (Google News RSS) -> k_psx_news  (auto "why" reasons)
     try:
         news = fetch_news()
         if news:
@@ -328,7 +292,6 @@ def main():
     except Exception as e:
         print("news warn:", e)
 
-    # last-update timestamp (epoch seconds, UTC) — dashboard staleness check
     try:
         put_json("/psxShared/k_psx_updated.json", int(time.time()))
         print("Wrote last-update timestamp.")
