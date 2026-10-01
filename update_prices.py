@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """PSX price robot — daily close prices to Firebase (k_psx_overrides).
-Primary: PSX DPS EOD endpoint. Fallback: PSX Terminal API. Read by PSX dashboard + Master PSX tab."""
+Sources (fallback order): Yahoo Finance (.KA), PSX DPS EOD, PSX Terminal.
+Read by PSX dashboard + Master PSX tab."""
 import requests, time
 
 DB = "https://psx-dashboard-2b391-default-rtdb.asia-southeast1.firebasedatabase.app"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-           "Accept": "application/json,text/plain,*/*",
-           "Referer": "https://dps.psx.com.pk/"}
+           "Accept": "application/json,text/plain,*/*"}
 SESS = requests.Session(); SESS.headers.update(HEADERS)
 
 def get_json(path, default):
@@ -23,28 +23,42 @@ def put_json(path, data):
     r = requests.put(DB + path, json=data, timeout=45)
     r.raise_for_status()
 
+def fetch_yahoo(sym):
+    """Yahoo Finance PSX (Karachi) — tries .KA then .KAR suffix."""
+    for suf in (".KA", ".KAR"):
+        try:
+            u = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}{suf}?range=5d&interval=1d"
+            r = SESS.get(u, timeout=20)
+            if r.ok:
+                j = r.json()
+                res = (j.get("chart") or {}).get("result")
+                if res:
+                    meta = res[0].get("meta") or {}
+                    px = meta.get("regularMarketPrice") or meta.get("previousClose") or meta.get("chartPreviousClose")
+                    if px and float(px) > 0:
+                        return float(px)
+        except Exception:
+            pass
+    return None
+
 def fetch_eod(sym):
-    """Latest close from PSX DPS EOD timeseries."""
     try:
-        r = SESS.get(f"https://dps.psx.com.pk/timeseries/eod/{sym}", timeout=25)
-        if not r.ok:
-            return None
-        j = r.json()
-        rows = j.get("data") if isinstance(j, dict) else j
-        if not rows:
-            return None
-        best_ts, best_px = -1, None
-        for row in rows:
-            if isinstance(row, (list, tuple)) and len(row) >= 2 and row[0] is not None and row[1] is not None:
-                try:
-                    ts = float(row[0]); px = float(row[1])
-                except (TypeError, ValueError):
-                    continue
-                if px > 0 and ts > best_ts:
-                    best_ts, best_px = ts, px
-        return best_px
+        r = SESS.get(f"https://dps.psx.com.pk/timeseries/eod/{sym}", timeout=25,
+                     headers={**HEADERS, "Referer": "https://dps.psx.com.pk/"})
+        if r.ok:
+            j = r.json()
+            rows = j.get("data") if isinstance(j, dict) else j
+            if rows:
+                bt, bp = -1, None
+                for row in rows:
+                    if isinstance(row, (list, tuple)) and len(row) >= 2 and row[0] is not None and row[1] is not None:
+                        try: ts = float(row[0]); px = float(row[1])
+                        except (TypeError, ValueError): continue
+                        if px > 0 and ts > bt: bt, bp = ts, px
+                return bp
     except Exception:
-        return None
+        pass
+    return None
 
 def fetch_terminal(sym):
     try:
@@ -67,23 +81,21 @@ def main():
     syms = [s for s in syms if s not in {"MIF"}]
     print(f"Portfolio symbols: {len(syms)} -> {syms}")
     if not syms:
-        print("No PSX symbols found in k_psx_portfolio. Robot exiting.")
+        print("No PSX symbols found in k_psx_portfolio. Exiting.")
         return
 
     overrides = get_json("/psxShared/k_psx_overrides.json", {}) or {}
     n = 0; fail = []
     for s in syms:
-        px = fetch_eod(s)
-        src = "EOD"
-        if not (px and px > 0):
-            px = fetch_terminal(s); src = "Terminal"
+        px, src = fetch_yahoo(s), "Yahoo"
+        if not (px and px > 0): px, src = fetch_eod(s), "EOD"
+        if not (px and px > 0): px, src = fetch_terminal(s), "Terminal"
         if px and px > 0:
-            overrides[s] = {"p": round(px, 2), "c": 0.0}
-            n += 1
+            overrides[s] = {"p": round(px, 2), "c": 0.0}; n += 1
             print(f"  {s}: {px} ({src})")
         else:
             fail.append(s)
-        time.sleep(0.4)
+        time.sleep(0.3)
 
     put_json("/psxShared/k_psx_overrides.json", overrides)
     put_json("/psxShared/k_psx_updated.json", int(time.time()))
