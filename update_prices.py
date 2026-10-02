@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""PSX price robot — daily close prices to Firebase (k_psx_overrides).
-Sources (fallback order): Yahoo Finance (.KA), PSX DPS EOD, PSX Terminal.
-Read by PSX dashboard + Master PSX tab."""
+"""PSX price robot — TradingView scanner API se live prices Firebase mein (k_psx_overrides).
+PSX dashboard + Master PSX tab dono isi se prices lete hain."""
 import requests, time
 
 DB = "https://psx-dashboard-2b391-default-rtdb.asia-southeast1.firebasedatabase.app"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-           "Accept": "application/json,text/plain,*/*"}
-SESS = requests.Session(); SESS.headers.update(HEADERS)
+           "Content-Type": "application/json",
+           "Origin": "https://www.tradingview.com",
+           "Referer": "https://www.tradingview.com/"}
 
 def get_json(path, default):
     try:
@@ -23,56 +23,30 @@ def put_json(path, data):
     r = requests.put(DB + path, json=data, timeout=45)
     r.raise_for_status()
 
-def fetch_yahoo(sym):
-    """Yahoo Finance PSX (Karachi) — tries .KA then .KAR suffix."""
-    for suf in (".KA", ".KAR"):
-        try:
-            u = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}{suf}?range=5d&interval=1d"
-            r = SESS.get(u, timeout=20)
-            if r.ok:
-                j = r.json()
-                res = (j.get("chart") or {}).get("result")
-                if res:
-                    meta = res[0].get("meta") or {}
-                    px = meta.get("regularMarketPrice") or meta.get("previousClose") or meta.get("chartPreviousClose")
-                    if px and float(px) > 0:
-                        return float(px)
-        except Exception:
-            pass
-    return None
-
-def fetch_eod(sym):
+def fetch_tradingview(syms):
+    """TradingView scanner — ek hi call mein saare PSX symbols."""
+    out = {}
+    tickers = ["PSX:" + s for s in syms]
+    body = {"symbols": {"tickers": tickers, "query": {"types": []}},
+            "columns": ["close", "change"]}
     try:
-        r = SESS.get(f"https://dps.psx.com.pk/timeseries/eod/{sym}", timeout=25,
-                     headers={**HEADERS, "Referer": "https://dps.psx.com.pk/"})
+        r = requests.post("https://scanner.tradingview.com/pakistan/scan",
+                          json=body, headers=HEADERS, timeout=30)
+        print("TradingView HTTP", r.status_code)
         if r.ok:
-            j = r.json()
-            rows = j.get("data") if isinstance(j, dict) else j
-            if rows:
-                bt, bp = -1, None
-                for row in rows:
-                    if isinstance(row, (list, tuple)) and len(row) >= 2 and row[0] is not None and row[1] is not None:
-                        try: ts = float(row[0]); px = float(row[1])
-                        except (TypeError, ValueError): continue
-                        if px > 0 and ts > bt: bt, bp = ts, px
-                return bp
-    except Exception:
-        pass
-    return None
-
-def fetch_terminal(sym):
-    try:
-        r = SESS.get(f"https://psxterminal.com/api/ticks/REG/{sym}", timeout=20)
-        if r.ok:
-            j = r.json(); d = j.get("data", j) if isinstance(j, dict) else j
-            if isinstance(d, dict):
-                for k in ("price","last","c","close","ltp","currentPrice","lastPrice"):
-                    if d.get(k) not in (None, ""):
-                        try: return float(d[k])
-                        except (TypeError, ValueError): pass
-    except Exception:
-        pass
-    return None
+            data = r.json().get("data", [])
+            for item in data:
+                s = item.get("s", "")           # "PSX:OGDC"
+                d = item.get("d", [])
+                sym = s.split(":")[-1]
+                if sym and d and d[0] and float(d[0]) > 0:
+                    out[sym] = {"p": round(float(d[0]), 2),
+                                "c": round(float(d[1]) if len(d) > 1 and d[1] is not None else 0.0, 2)}
+        else:
+            print("TradingView body:", r.text[:200])
+    except Exception as e:
+        print("TradingView error:", e)
+    return out
 
 def main():
     pf = get_json("/psxShared/k_psx_portfolio.json", [])
@@ -81,25 +55,22 @@ def main():
     syms = [s for s in syms if s not in {"MIF"}]
     print(f"Portfolio symbols: {len(syms)} -> {syms}")
     if not syms:
-        print("No PSX symbols found in k_psx_portfolio. Exiting.")
+        print("No PSX symbols found. Exiting.")
         return
 
+    prices = fetch_tradingview(syms)
     overrides = get_json("/psxShared/k_psx_overrides.json", {}) or {}
     n = 0; fail = []
     for s in syms:
-        px, src = fetch_yahoo(s), "Yahoo"
-        if not (px and px > 0): px, src = fetch_eod(s), "EOD"
-        if not (px and px > 0): px, src = fetch_terminal(s), "Terminal"
-        if px and px > 0:
-            overrides[s] = {"p": round(px, 2), "c": 0.0}; n += 1
-            print(f"  {s}: {px} ({src})")
+        if s in prices:
+            overrides[s] = prices[s]; n += 1
+            print(f"  {s}: {prices[s]['p']}")
         else:
             fail.append(s)
-        time.sleep(0.3)
 
     put_json("/psxShared/k_psx_overrides.json", overrides)
     put_json("/psxShared/k_psx_updated.json", int(time.time()))
-    print(f"Updated {n}/{len(syms)} PSX prices.")
+    print(f"Updated {n}/{len(syms)} PSX prices via TradingView.")
     if fail:
         print("Not found:", ", ".join(fail))
 
