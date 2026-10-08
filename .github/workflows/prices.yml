@@ -1,39 +1,23 @@
 name: Update PSX prices
 
 on:
+  workflow_dispatch:        # manual run button
   schedule:
-    # Har 10 min, UTC 4:00-10:59 (= PKT 9:00 AM - 3:59 PM), Mon-Fri
-    - cron: "*/10 4-10 * * 1-5"
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    # PSX hours ~9:15 AM – 3:30 PM PKT (PKT = UTC+5) => ~4:15–10:30 UTC
+    # Runs every 20 minutes, Monday–Friday
+    - cron: '*/20 4-11 * * 1-5'
 
 jobs:
   update-prices:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-
-      - run: pip install requests beautifulsoup4
-
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install requests
       - name: Fetch latest prices
         run: python update_prices.py
-
-      - name: Commit & push updated prices
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -n "$(git status --porcelain)" ]; then
-            git add -A
-            git commit -m "Auto-update PSX prices [skip ci]"
-            git push
-            echo "Prices updated and pushed."
-          else
-            echo "No price changes to commit."
-          fi
